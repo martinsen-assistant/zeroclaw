@@ -2666,10 +2666,11 @@ async fn build_memory_context(
     mem: &dyn Memory,
     user_msg: &str,
     min_relevance_score: f64,
+    session_id: Option<&str>,
 ) -> String {
     let mut context = String::new();
 
-    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
+    if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
         let mut included = 0usize;
         let mut used_chars = 0usize;
 
@@ -3257,7 +3258,7 @@ or tune thresholds in config.",
                 &autosave_key,
                 &msg.content,
                 crate::memory::MemoryCategory::Conversation,
-                None,
+                Some(&history_key),
             )
             .await;
     }
@@ -3313,6 +3314,7 @@ or tune thresholds in config.",
                     ctx.memory.as_ref(),
                     &msg.content,
                     ctx.min_relevance_score,
+                    Some(&history_key),
                 )
                 .await;
                 if !memory_context.is_empty() {
@@ -10056,9 +10058,35 @@ BTC is currently around $65,000 based on latest tool output."#
             .await
             .unwrap();
 
-        let context = build_memory_context(&mem, "age", 0.0).await;
+        let context = build_memory_context(&mem, "age", 0.0, None).await;
         assert!(context.contains("[Memory context]"));
         assert!(context.contains("Age is 45"));
+    }
+
+    #[tokio::test]
+    async fn build_memory_context_respects_session_scope() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        mem.store(
+            "session_a_fact",
+            "Session A remembers age 45",
+            MemoryCategory::Conversation,
+            Some("session-a"),
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "session_b_fact",
+            "Session B remembers age 31",
+            MemoryCategory::Conversation,
+            Some("session-b"),
+        )
+        .await
+        .unwrap();
+
+        let session_a_context = build_memory_context(&mem, "age", 0.0, Some("session-a")).await;
+        assert!(session_a_context.contains("age 45"));
+        assert!(!session_a_context.contains("age 31"));
     }
 
     #[tokio::test]
