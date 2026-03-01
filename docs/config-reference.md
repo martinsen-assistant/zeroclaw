@@ -125,6 +125,7 @@ Operational note for container users:
 | Key | Default | Purpose |
 |---|---|---|
 | `compact_context` | `true` | When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models |
+| `session` | see below | Session persistence backend/strategy/TTL controls under `[agent.session]` |
 | `max_tool_iterations` | `20` | Maximum tool-call loop turns per user message across CLI, gateway, and channels |
 | `max_history_messages` | `50` | Maximum conversation history messages retained per session |
 | `parallel_tools` | `false` | Enable parallel tool execution within a single iteration |
@@ -140,6 +141,33 @@ Notes:
 - In CLI, gateway, and channel tool loops, multiple independent tool calls are executed concurrently by default when the pending calls do not require approval gating; result order remains stable.
 - `parallel_tools` applies to the `Agent::turn()` API surface. It does not gate the runtime loop used by CLI, gateway, or channel handlers.
 - **Loop detection** intervenes before `max_tool_iterations` is exhausted. On first detection the agent receives a self-correction prompt; if the loop persists the agent is stopped early. Detection is result-aware: repeated calls with *different* outputs (genuine progress) do not trigger. Set any threshold to `0` to disable that detector.
+
+## `[agent.session]`
+
+Persistent session controls for CLI/channel/gateway conversation state.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `backend` | `none` | Session store backend: `none`, `memory`, or `sqlite` |
+| `strategy` | `per-sender` | Session keying strategy: `per-sender`, `per-channel`, or `main` |
+| `ttl_seconds` | `3600` | Session expiry TTL in seconds |
+| `max_messages` | `50` | Max retained messages per resolved session |
+
+Strategy behavior:
+
+- `per-sender`: one session per sender identity (channel-qualified when channel is known).
+- `per-channel`: one shared session per channel.
+- `main`: one global shared session.
+
+Example:
+
+```toml
+[agent.session]
+backend = "sqlite"
+strategy = "per-sender"
+ttl_seconds = 7200
+max_messages = 120
+```
 
 ## `[security.otp]`
 
