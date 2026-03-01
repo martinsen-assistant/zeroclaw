@@ -4961,6 +4961,7 @@ mod tests {
 
     #[test]
     fn telegram_mention_only_group_photo_without_caption_is_ignored() {
+        // Regression guard: captionless group media must not bypass mention_only gating.
         let ch = TelegramChannel::new("token".into(), vec!["*".into()], true, true);
         {
             let mut cache = ch.bot_username.lock();
