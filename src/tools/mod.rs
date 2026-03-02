@@ -312,6 +312,7 @@ pub fn all_tools(
         agents,
         fallback_api_key,
         root_config,
+        None, // memory_session_id
     )
 }
 
@@ -894,6 +895,7 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            None, // memory_session_id
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"wasm_module"));
@@ -935,6 +937,7 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            None, // memory_session_id
         );
 
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();

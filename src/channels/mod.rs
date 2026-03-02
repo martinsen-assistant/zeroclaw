@@ -5434,6 +5434,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        None, // memory_session_id
     );
 
     // Wire MCP tools into the registry before freezing — non-fatal.
