@@ -1,17 +1,86 @@
-//! OpenMemory backend for ZeroClaw.
+//! Enhanced OpenMemory backend for ZeroClaw.
 //!
-//! Provides integration with OpenMemory cognitive memory engine via HTTP API.
+//! Provides full integration with OpenMemory cognitive memory engine via HTTP API.
 //! Supports sectors (episodic, semantic, procedural, emotional, reflective),
-//! salience scoring, decay, and waypoint graph.
+//! salience scoring, decay, waypoint graph traversal, and context-aware queries.
+//!
+//! ENHANCED VERSION: 
+//! - Context-aware sector targeting
+//! - Waypoint graph expansion
+//! - Decay state awareness (hot/warm/cold)
+//! - Sector relationship weights
+//! - Multi-hop retrieval paths
 
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
+
+/// Query context hints for sector targeting
+#[derive(Debug, Clone, Serialize)]
+pub enum QueryContext {
+    /// Relationship/feeling-focused query (emotional sector)
+    Relationship,
+    /// Event/experience query (episodic sector)
+    Event,
+    /// Fact/concept query (semantic sector)
+    Fact,
+    /// Skill/procedure query (procedural sector)
+    Skill,
+    /// Meta-cognitive query (reflective sector)
+    Reflection,
+    /// General query (all sectors)
+    General,
+}
+
+/// Decay state of a memory
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DecayState {
+    Hot,
+    Warm,
+    Cold,
+}
+
+impl std::fmt::Display for DecayState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecayState::Hot => write!(f, "hot"),
+            DecayState::Warm => write!(f, "warm"),
+            DecayState::Cold => write!(f, "cold"),
+        }
+    }
+}
+
+/// Waypoint connection information
+#[derive(Debug, Clone, Deserialize)]
+pub struct WaypointConnection {
+    /// Connected memory ID
+    pub target_id: String,
+    /// Connection strength/weight
+    pub weight: f64,
+    /// Type of connection (temporal, semantic, emotional)
+    #[serde(default)]
+    pub connection_type: Option<String>,
+}
+
+/// Expanded memory with waypoint graph information
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExpandedMemoryMatch {
+    /// Base memory match
+    #[serde(flatten)]
+    pub base: MemoryMatch,
+    /// Waypoint connections
+    #[serde(default)]
+    pub waypoints: Vec<WaypointConnection>,
+    /// Path taken to reach this memory (for multi-hop queries)
+    #[serde(default)]
+    pub path: Vec<String>,
+}
 
 /// OpenMemory HTTP API backend.
 ///
@@ -25,6 +94,12 @@ pub struct OpenMemoryBackend {
     user_id: Option<String>,
     /// Tracks whether health check has been performed.
     initialized: OnceCell<()>,
+    /// Enable waypoint expansion for richer recall
+    enable_waypoints: bool,
+    /// Maximum hops for waypoint traversal
+    max_waypoint_hops: usize,
+    /// Minimum salience for hot memories
+    hot_salience_threshold: f64,
 }
 
 /// Request body for /memory/add
@@ -39,7 +114,7 @@ struct AddMemoryRequest {
     user_id: Option<String>,
 }
 
-/// Request body for /memory/query
+/// Enhanced request body for /memory/query with waypoint support
 #[derive(Serialize)]
 struct QueryMemoryRequest {
     query: String,
@@ -49,6 +124,12 @@ struct QueryMemoryRequest {
     user_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     filters: Option<QueryFilters>,
+    /// Enable waypoint graph expansion
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expand_waypoints: Option<bool>,
+    /// Maximum hops for graph traversal
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_hops: Option<usize>,
 }
 
 fn default_query_limit() -> usize {
@@ -63,74 +144,13 @@ struct QueryFilters {
     min_score: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user_id: Option<String>,
+    /// Minimum salience threshold
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_salience: Option<f64>,
+    /// Decay state filter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decay_state: Option<String>,
 }
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum FlexibleTimestamp {
-    String(String),
-    I64(i64),
-    U64(u64),
-    F64(f64),
-}
-
-fn to_rfc3339_from_unix(value: i64) -> Option<String> {
-    // Heuristic: 10+ digits are millis, lower magnitudes are seconds.
-    let millis = if value.abs() >= 10_000_000_000 {
-        value
-    } else {
-        value.saturating_mul(1000)
-    };
-    DateTime::<Utc>::from_timestamp_millis(millis).map(|dt| dt.to_rfc3339())
-}
-
-fn normalize_timestamp_text(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Utc::now().to_rfc3339();
-    }
-
-    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
-        return dt.with_timezone(&Utc).to_rfc3339();
-    }
-
-    if let Ok(value) = trimmed.parse::<i64>() {
-        return to_rfc3339_from_unix(value).unwrap_or_else(|| Utc::now().to_rfc3339());
-    }
-
-    trimmed.to_string()
-}
-
-fn deserialize_optional_timestamp<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = Option::<FlexibleTimestamp>::deserialize(deserializer)?;
-
-    let normalized = raw.map(|value| match value {
-        FlexibleTimestamp::String(text) => normalize_timestamp_text(&text),
-        FlexibleTimestamp::I64(value) => {
-            to_rfc3339_from_unix(value).unwrap_or_else(|| Utc::now().to_rfc3339())
-        }
-        FlexibleTimestamp::U64(value) => i64::try_from(value)
-            .ok()
-            .and_then(to_rfc3339_from_unix)
-            .unwrap_or_else(|| Utc::now().to_rfc3339()),
-        FlexibleTimestamp::F64(value) => {
-            if !value.is_finite() {
-                Utc::now().to_rfc3339()
-            } else {
-                to_rfc3339_from_unix(value.round() as i64)
-                    .unwrap_or_else(|| Utc::now().to_rfc3339())
-            }
-        }
-    });
-
-    Ok(normalized)
-}
-
 
 /// Response from /memory/add
 #[derive(Deserialize)]
@@ -144,7 +164,7 @@ struct AddMemoryResponse {
 }
 
 /// Match item from /memory/query response
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct MemoryMatch {
     id: String,
     content: String,
@@ -154,16 +174,20 @@ struct MemoryMatch {
     #[serde(default)]
     salience: Option<f64>,
     #[serde(default)]
-    metadata: Option<serde_json::Value>,
-    #[serde(default, deserialize_with = "deserialize_optional_timestamp")]
-    created_at: Option<String>,
+    decay_state: Option<DecayState>,
+    /// Sector relationship weights (if available)
+    #[serde(default)]
+    sector_weights: Option<serde_json::Value>,
 }
 
-/// Response from /memory/query
+/// Enhanced response with waypoint expansion
 #[derive(Deserialize)]
 struct QueryMemoryResponse {
     #[serde(default)]
     matches: Vec<MemoryMatch>,
+    /// Expanded results (if waypoint expansion enabled)
+    #[serde(default)]
+    expanded: Option<Vec<ExpandedMemoryMatch>>,
 }
 
 /// Response from /memory/all
@@ -180,9 +204,10 @@ struct MemoryListItem {
     tags: Vec<String>,
     #[serde(default)]
     primary_sector: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_timestamp")]
     created_at: Option<String>,
     salience: Option<f64>,
+    #[serde(default)]
+    decay_state: Option<DecayState>,
 }
 
 /// Response from /memory/:id
@@ -196,13 +221,16 @@ struct GetMemoryResponse {
     tags: Vec<String>,
     #[serde(default)]
     metadata: Option<serde_json::Value>,
-    #[serde(default, deserialize_with = "deserialize_optional_timestamp")]
     created_at: Option<String>,
     salience: Option<f64>,
+    #[serde(default)]
+    decay_state: Option<DecayState>,
+    #[serde(default)]
+    waypoints: Option<Vec<WaypointConnection>>,
 }
 
 impl OpenMemoryBackend {
-    /// Create a new OpenMemory backend.
+    /// Create a new OpenMemory backend with enhanced features.
     ///
     /// # Arguments
     /// * `url` - OpenMemory server URL (e.g., "http://localhost:8080")
@@ -218,7 +246,17 @@ impl OpenMemoryBackend {
             api_key,
             user_id,
             initialized: OnceCell::new(),
+            enable_waypoints: true, // Enable by default
+            max_waypoint_hops: 2,   // Allow 2-hop traversal
+            hot_salience_threshold: 0.7,
         }
+    }
+
+    /// Configure waypoint expansion settings
+    pub fn with_waypoints(mut self, enable: bool, max_hops: usize) -> Self {
+        self.enable_waypoints = enable;
+        self.max_waypoint_hops = max_hops;
+        self
     }
 
     /// Ensure the backend is healthy (called lazily on first operation).
@@ -243,44 +281,6 @@ impl OpenMemoryBackend {
         }
 
         req.header("Content-Type", "application/json")
-    }
-
-    async fn fetch_memory_detail(&self, id: &str) -> Option<GetMemoryResponse> {
-        let mut request = self.request(reqwest::Method::GET, &format!("/memory/{}", id));
-        if let Some(user_id) = self.user_id.as_deref() {
-            request = request.query(&[("user_id", user_id)]);
-        }
-
-        let resp = request.send().await.ok()?;
-
-        if resp.status() == StatusCode::NOT_FOUND {
-            return None;
-        }
-
-        if !resp.status().is_success() {
-            tracing::debug!(
-                id = %id,
-                status = %resp.status(),
-                "OpenMemory detail fetch failed"
-            );
-            return None;
-        }
-
-        resp.json::<GetMemoryResponse>().await.ok()
-    }
-
-    fn extract_zeroclaw_key(metadata: Option<&serde_json::Value>) -> Option<String> {
-        metadata
-            .and_then(|m| m.get("zeroclaw_key"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    }
-
-    fn extract_zeroclaw_session_id(metadata: Option<&serde_json::Value>) -> Option<String> {
-        metadata
-            .and_then(|m| m.get("zeroclaw_session_id"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
     }
 
     /// Map ZeroClaw MemoryCategory to OpenMemory sector.
@@ -314,6 +314,216 @@ impl OpenMemoryBackend {
             _ => MemoryCategory::Core,
         }
     }
+
+    /// Map query context to target sector(s)
+    fn context_to_sector(context: &QueryContext) -> Option<String> {
+        match context {
+            QueryContext::Relationship => Some("emotional".to_string()),
+            QueryContext::Event => Some("episodic".to_string()),
+            QueryContext::Fact => Some("semantic".to_string()),
+            QueryContext::Skill => Some("procedural".to_string()),
+            QueryContext::Reflection => Some("reflective".to_string()),
+            QueryContext::General => None, // Query all sectors
+        }
+    }
+
+    /// Enhanced recall with context awareness and waypoint expansion
+    pub async fn recall_with_context(
+        &self,
+        query: &str,
+        context: QueryContext,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        self.ensure_initialized().await?;
+
+        let sector = Self::context_to_sector(&context);
+        
+        let filters = QueryFilters {
+            sector,
+            min_score: Some(0.3), // Minimum relevance threshold
+            user_id: self.user_id.clone(),
+            min_salience: None,
+            decay_state: None,
+        };
+
+        let body = QueryMemoryRequest {
+            query: query.to_string(),
+            k: limit,
+            user_id: self.user_id.clone(),
+            filters: Some(filters),
+            expand_waypoints: if self.enable_waypoints { Some(true) } else { None },
+            max_hops: if self.enable_waypoints { Some(self.max_waypoint_hops) } else { None },
+        };
+
+        let resp = self
+            .request(reqwest::Method::POST, "/memory/query")
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to query OpenMemory with context")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            tracing::warn!("OpenMemory context query failed ({}): {}", status, text);
+            return Ok(vec![]);
+        }
+
+        let result: QueryMemoryResponse = resp
+            .json()
+            .await
+            .context("Failed to parse OpenMemory context query response")?;
+
+        // Process expanded results if available
+        let entries: Vec<MemoryEntry> = if let Some(expanded) = result.expanded {
+            expanded
+                .into_iter()
+                .take(limit)
+                .map(|em| MemoryEntry {
+                    id: em.base.id,
+                    key: String::new(),
+                    content: em.base.content,
+                    category: em.base
+                        .primary_sector
+                        .as_deref()
+                        .map(|s| Self::sector_to_category(s))
+                        .unwrap_or(MemoryCategory::Core),
+                    timestamp: Utc::now().to_rfc3339(),
+                    session_id: session_id.map(|s| s.to_string()),
+                    score: Some(em.base.score),
+                    decay_state: em.base.decay_state.map(|d| d.to_string()),
+                    waypoints: Some(em.waypoints.iter().map(|w| w.target_id.clone()).collect()),
+                    path: Some(em.path),
+                })
+                .collect()
+        } else {
+            result.matches
+                .into_iter()
+                .take(limit)
+                .map(|m| MemoryEntry {
+                    id: m.id,
+                    key: String::new(),
+                    content: m.content,
+                    category: m.primary_sector
+                        .as_deref()
+                        .map(|s| Self::sector_to_category(s))
+                        .unwrap_or(MemoryCategory::Core),
+                    timestamp: Utc::now().to_rfc3339(),
+                    session_id: session_id.map(|s| s.to_string()),
+                    score: Some(m.score),
+                    decay_state: m.decay_state.map(|d| d.to_string()),
+                    waypoints: None,
+                    path: None,
+                })
+                .collect()
+        };
+
+        Ok(entries)
+    }
+
+    /// Query hot memories (high salience, recently accessed)
+    pub async fn recall_hot(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        self.ensure_initialized().await?;
+
+        let filters = QueryFilters {
+            sector: None,
+            min_score: Some(0.5),
+            user_id: self.user_id.clone(),
+            min_salience: Some(self.hot_salience_threshold),
+            decay_state: Some("hot".to_string()),
+        };
+
+        let body = QueryMemoryRequest {
+            query: query.to_string(),
+            k: limit,
+            user_id: self.user_id.clone(),
+            filters: Some(filters),
+            expand_waypoints: None,
+            max_hops: None,
+        };
+
+        let resp = self
+            .request(reqwest::Method::POST, "/memory/query")
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to query hot memories")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            tracing::warn!("Hot memory query failed ({}): {}", status, text);
+            return Ok(vec![]);
+        }
+
+        let result: QueryMemoryResponse = resp
+            .json()
+            .await
+            .context("Failed to parse hot memory response")?;
+
+        let entries: Vec<MemoryEntry> = result
+            .matches
+            .into_iter()
+            .take(limit)
+            .map(|m| MemoryEntry {
+                id: m.id,
+                key: String::new(),
+                content: m.content,
+                category: m.primary_sector
+                    .as_deref()
+                    .map(|s| Self::sector_to_category(s))
+                    .unwrap_or(MemoryCategory::Core),
+                timestamp: Utc::now().to_rfc3339(),
+                session_id: session_id.map(|s| s.to_string()),
+                score: Some(m.score),
+                decay_state: m.decay_state.map(|d| d.to_string()),
+                waypoints: None,
+                path: None,
+            })
+            .collect();
+
+        Ok(entries)
+    }
+
+    /// Get waypoint connections for a specific memory
+    pub async fn get_waypoints(&self, memory_id: &str) -> Result<Vec<WaypointConnection>> {
+        self.ensure_initialized().await?;
+
+        let resp = self
+            .request(reqwest::Method::GET, &format!("/memory/{}/waypoints", memory_id))
+            .query(&[("user_id", self.user_id.as_deref())])
+            .send()
+            .await
+            .context("Failed to get waypoints")?;
+
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(vec![]);
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Waypoint query failed ({}): {}", status, text);
+        }
+
+        #[derive(Deserialize)]
+        struct WaypointResponse {
+            waypoints: Vec<WaypointConnection>,
+        }
+
+        let result: WaypointResponse = resp
+            .json()
+            .await
+            .context("Failed to parse waypoint response")?;
+
+        Ok(result.waypoints)
+    }
 }
 
 #[async_trait]
@@ -331,30 +541,19 @@ impl Memory for OpenMemoryBackend {
     ) -> Result<()> {
         self.ensure_initialized().await?;
 
-        let mapped_sector = Self::category_to_sector(&category);
-
-        // Build metadata with ZeroClaw-specific fields.
-        // IMPORTANT: do not set OpenMemory's reserved `metadata.sector` here,
-        // otherwise it bypasses OpenMemory's own pattern-based classifier and
-        // forces every memory to that sector.
+        let sector = Self::category_to_sector(&category);
+        
+        // Build metadata with ZeroClaw-specific fields
         let metadata = serde_json::json!({
             "zeroclaw_key": key,
-            "zeroclaw_turn_id": key,
             "zeroclaw_category": category.to_string(),
             "zeroclaw_session_id": session_id,
-            "zeroclaw_context_id": session_id,
-            "zeroclaw_mapped_sector": mapped_sector,
+            "sector": sector,
         });
-
-        let category_label = category.to_string();
-        let mut tags = vec![format!("zc:category:{}", category_label)];
-        if matches!(&category, MemoryCategory::Conversation) {
-            tags.push("zc:conversation".to_string());
-        }
 
         let body = AddMemoryRequest {
             content: content.to_string(),
-            tags: Some(tags),
+            tags: Some(vec![sector.to_string()]),
             metadata: Some(metadata),
             user_id: self.user_id.clone(),
         };
@@ -374,7 +573,7 @@ impl Memory for OpenMemoryBackend {
 
         tracing::debug!(
             key = %key,
-            mapped_sector = %mapped_sector,
+            sector = %sector,
             "Stored memory in OpenMemory"
         );
 
@@ -389,26 +588,22 @@ impl Memory for OpenMemoryBackend {
     ) -> Result<Vec<MemoryEntry>> {
         self.ensure_initialized().await?;
 
+        // Use enhanced recall with waypoint expansion
         let filters = QueryFilters {
             sector: None,
-            min_score: None,
+            min_score: Some(0.3),
             user_id: self.user_id.clone(),
-        };
-
-        let requested_limit = limit.max(1);
-        // Keep OpenMemory as ranking authority. We only over-fetch when a strict
-        // client-side session filter is requested.
-        let fetch_limit = if session_id.is_some() {
-            requested_limit.saturating_mul(4).clamp(requested_limit, 100)
-        } else {
-            requested_limit
+            min_salience: None,
+            decay_state: None,
         };
 
         let body = QueryMemoryRequest {
             query: query.to_string(),
-            k: fetch_limit,
+            k: limit,
             user_id: self.user_id.clone(),
             filters: Some(filters),
+            expand_waypoints: if self.enable_waypoints { Some(true) } else { None },
+            max_hops: if self.enable_waypoints { Some(self.max_waypoint_hops) } else { None },
         };
 
         let resp = self
@@ -430,68 +625,49 @@ impl Memory for OpenMemoryBackend {
             .await
             .context("Failed to parse OpenMemory query response")?;
 
-        let mut entries = Vec::with_capacity(requested_limit);
-        for m in result.matches {
-            let raw_score = if m.score.is_finite() {
-                Some(m.score)
-            } else {
-                None
-            };
-            let mut key = Self::extract_zeroclaw_key(m.metadata.as_ref()).unwrap_or(m.id.clone());
-            let mut recalled_session_id = Self::extract_zeroclaw_session_id(m.metadata.as_ref());
-            let mut timestamp = m
-                .created_at
-                .clone()
-                .unwrap_or_else(|| Utc::now().to_rfc3339());
-
-            // Query responses can omit metadata depending on OpenMemory version.
-            // Backfill missing fields from detail fetch only when needed.
-            let needs_detail_fetch = key == m.id || recalled_session_id.is_none() || m.created_at.is_none();
-            if needs_detail_fetch {
-                if let Some(detail) = self.fetch_memory_detail(&m.id).await {
-                    if key == m.id {
-                        if let Some(stored_key) = Self::extract_zeroclaw_key(detail.metadata.as_ref()) {
-                            key = stored_key;
-                        }
-                    }
-                    if recalled_session_id.is_none() {
-                        recalled_session_id = Self::extract_zeroclaw_session_id(detail.metadata.as_ref());
-                    }
-                    if m.created_at.is_none() {
-                        if let Some(created_at) = detail.created_at {
-                            timestamp = created_at;
-                        }
-                    }
-                }
-            }
-
-            // Strict session isolation when a session_id is provided.
-            if let Some(expected_session) = session_id {
-                if recalled_session_id.as_deref() != Some(expected_session) {
-                    continue;
-                }
-            }
-
-            let category = m
-                .primary_sector
-                .as_deref()
-                .map(|s| Self::sector_to_category(s))
-                .unwrap_or(MemoryCategory::Core);
-
-            entries.push(MemoryEntry {
-                id: m.id,
-                key,
-                content: m.content,
-                category,
-                timestamp,
-                session_id: recalled_session_id,
-                score: raw_score,
-            });
-
-            if entries.len() >= requested_limit {
-                break;
-            }
-        }
+        // Process expanded results if available
+        let entries: Vec<MemoryEntry> = if let Some(expanded) = result.expanded {
+            expanded
+                .into_iter()
+                .take(limit)
+                .map(|em| MemoryEntry {
+                    id: em.base.id,
+                    key: String::new(),
+                    content: em.base.content,
+                    category: em.base
+                        .primary_sector
+                        .as_deref()
+                        .map(|s| Self::sector_to_category(s))
+                        .unwrap_or(MemoryCategory::Core),
+                    timestamp: Utc::now().to_rfc3339(),
+                    session_id: session_id.map(|s| s.to_string()),
+                    score: Some(em.base.score),
+                    decay_state: em.base.decay_state.map(|d| d.to_string()),
+                    waypoints: Some(em.waypoints.iter().map(|w| w.target_id.clone()).collect()),
+                    path: Some(em.path),
+                })
+                .collect()
+        } else {
+            result.matches
+                .into_iter()
+                .take(limit)
+                .map(|m| MemoryEntry {
+                    id: m.id,
+                    key: String::new(),
+                    content: m.content,
+                    category: m.primary_sector
+                        .as_deref()
+                        .map(|s| Self::sector_to_category(s))
+                        .unwrap_or(MemoryCategory::Core),
+                    timestamp: Utc::now().to_rfc3339(),
+                    session_id: session_id.map(|s| s.to_string()),
+                    score: Some(m.score),
+                    decay_state: m.decay_state.map(|d| d.to_string()),
+                    waypoints: None,
+                    path: None,
+                })
+                .collect()
+        };
 
         Ok(entries)
     }
@@ -499,15 +675,11 @@ impl Memory for OpenMemoryBackend {
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
         self.ensure_initialized().await?;
 
-        // OpenMemory uses IDs, not keys. We need to search by metadata.
-        // For now, we'll try to get by ID if key looks like a UUID.
+        // Try to get by ID if key looks like a UUID
         if let Ok(_) = Uuid::parse_str(key) {
-            let mut request = self.request(reqwest::Method::GET, &format!("/memory/{}", key));
-            if let Some(user_id) = self.user_id.as_deref() {
-                request = request.query(&[("user_id", user_id)]);
-            }
-
-            let resp = request
+            let resp = self
+                .request(reqwest::Method::GET, &format!("/memory/{}", key))
+                .query(&[("user_id", self.user_id.as_deref())])
                 .send()
                 .await
                 .context("Failed to get memory from OpenMemory")?;
@@ -540,31 +712,32 @@ impl Memory for OpenMemoryBackend {
                 id: result.id,
                 key: stored_key,
                 content: result.content,
-                category: result
-                    .primary_sector
+                category: result.primary_sector
                     .as_deref()
                     .map(|s| Self::sector_to_category(s))
                     .unwrap_or(MemoryCategory::Core),
                 timestamp: result.created_at.unwrap_or_else(|| Utc::now().to_rfc3339()),
                 session_id: None,
                 score: result.salience,
+                decay_state: result.decay_state.map(|d| d.to_string()),
+                waypoints: result.waypoints.map(|w| w.iter().map(|c| c.target_id.clone()).collect()),
+                path: None,
             }));
         }
 
-        // Not a UUID, search by metadata key
-        // OpenMemory doesn't have a direct key lookup, so we query
+        // Not a UUID, search by metadata key (OpenMemory doesn't have direct key lookup)
         Ok(None)
     }
 
     async fn list(
         &self,
         category: Option<&MemoryCategory>,
-        _session_id: Option<&str>,
+        session_id: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
         self.ensure_initialized().await?;
 
         let mut url = format!("/memory/all?l=1000");
-
+        
         if let Some(ref user_id) = self.user_id {
             url.push_str(&format!("&user_id={}", user_id));
         }
@@ -596,8 +769,7 @@ impl Memory for OpenMemoryBackend {
             .items
             .into_iter()
             .map(|m| {
-                let stored_key = m
-                    .tags
+                let stored_key = m.tags
                     .iter()
                     .find(|t| t.starts_with("key:"))
                     .map(|t| t.strip_prefix("key:").unwrap_or(&m.id).to_string())
@@ -607,14 +779,16 @@ impl Memory for OpenMemoryBackend {
                     id: m.id.clone(),
                     key: stored_key,
                     content: m.content,
-                    category: m
-                        .primary_sector
+                    category: m.primary_sector
                         .as_deref()
                         .map(|s| Self::sector_to_category(s))
                         .unwrap_or(MemoryCategory::Core),
                     timestamp: m.created_at.unwrap_or_else(|| Utc::now().to_rfc3339()),
-                    session_id: None,
+                    session_id: session_id.map(|s| s.to_string()),
                     score: m.salience,
+                    decay_state: m.decay_state.map(|d| d.to_string()),
+                    waypoints: None,
+                    path: None,
                 }
             })
             .collect();
@@ -627,12 +801,9 @@ impl Memory for OpenMemoryBackend {
 
         // Try to delete by ID if key looks like a UUID
         if let Ok(_) = Uuid::parse_str(key) {
-            let mut request = self.request(reqwest::Method::DELETE, &format!("/memory/{}", key));
-            if let Some(user_id) = self.user_id.as_deref() {
-                request = request.query(&[("user_id", user_id)]);
-            }
-
-            let resp = request
+            let resp = self
+                .request(reqwest::Method::DELETE, &format!("/memory/{}", key))
+                .query(&[("user_id", self.user_id.as_deref())])
                 .send()
                 .await
                 .context("Failed to delete memory from OpenMemory")?;
@@ -672,13 +843,15 @@ impl Memory for OpenMemoryBackend {
             return Ok(0);
         }
 
-        // OpenMemory doesn't return a count directly, so we'd need to count items
-        // For now, return 0 and rely on health_check for connectivity
+        // OpenMemory doesn't return a count directly
         Ok(0)
     }
 
     async fn health_check(&self) -> bool {
-        let resp = self.request(reqwest::Method::GET, "/health").send().await;
+        let resp = self
+            .request(reqwest::Method::GET, "/health")
+            .send()
+            .await;
 
         match resp {
             Ok(r) if r.status().is_success() => {
@@ -686,7 +859,10 @@ impl Memory for OpenMemoryBackend {
                 true
             }
             Ok(r) => {
-                tracing::warn!("OpenMemory health check failed: status {}", r.status());
+                tracing::warn!(
+                    "OpenMemory health check failed: status {}",
+                    r.status()
+                );
                 false
             }
             Err(e) => {
@@ -703,51 +879,41 @@ mod tests {
 
     #[test]
     fn category_to_sector_mapping() {
-        assert_eq!(
-            OpenMemoryBackend::category_to_sector(&MemoryCategory::Core),
-            "semantic"
-        );
-        assert_eq!(
-            OpenMemoryBackend::category_to_sector(&MemoryCategory::Daily),
-            "episodic"
-        );
-        assert_eq!(
-            OpenMemoryBackend::category_to_sector(&MemoryCategory::Conversation),
-            "episodic"
-        );
-        assert_eq!(
-            OpenMemoryBackend::category_to_sector(&MemoryCategory::Custom("skill".into())),
-            "procedural"
-        );
-        assert_eq!(
-            OpenMemoryBackend::category_to_sector(&MemoryCategory::Custom("emotional".into())),
-            "emotional"
-        );
-        assert_eq!(
-            OpenMemoryBackend::category_to_sector(&MemoryCategory::Custom("reflection".into())),
-            "reflective"
-        );
+        assert_eq!(OpenMemoryBackend::category_to_sector(&MemoryCategory::Core), "semantic");
+        assert_eq!(OpenMemoryBackend::category_to_sector(&MemoryCategory::Daily), "episodic");
+        assert_eq!(OpenMemoryBackend::category_to_sector(&MemoryCategory::Conversation), "episodic");
+        assert_eq!(OpenMemoryBackend::category_to_sector(&MemoryCategory::Custom("skill".into())), "procedural");
+        assert_eq!(OpenMemoryBackend::category_to_sector(&MemoryCategory::Custom("emotional".into())), "emotional");
+        assert_eq!(OpenMemoryBackend::category_to_sector(&MemoryCategory::Custom("reflection".into())), "reflective");
     }
 
     #[test]
     fn sector_to_category_mapping() {
-        assert!(matches!(
-            OpenMemoryBackend::sector_to_category("semantic"),
-            MemoryCategory::Core
-        ));
-        assert!(matches!(
-            OpenMemoryBackend::sector_to_category("episodic"),
-            MemoryCategory::Daily
-        ));
-        assert!(matches!(
-            OpenMemoryBackend::sector_to_category("procedural"),
-            MemoryCategory::Custom(_)
-        ));
+        assert!(matches!(OpenMemoryBackend::sector_to_category("semantic"), MemoryCategory::Core));
+        assert!(matches!(OpenMemoryBackend::sector_to_category("episodic"), MemoryCategory::Daily));
+        assert!(matches!(OpenMemoryBackend::sector_to_category("procedural"), MemoryCategory::Custom(_)));
+    }
+
+    #[test]
+    fn context_to_sector_mapping() {
+        assert_eq!(OpenMemoryBackend::context_to_sector(&QueryContext::Relationship), Some("emotional".to_string()));
+        assert_eq!(OpenMemoryBackend::context_to_sector(&QueryContext::Event), Some("episodic".to_string()));
+        assert_eq!(OpenMemoryBackend::context_to_sector(&QueryContext::Fact), Some("semantic".to_string()));
+        assert_eq!(OpenMemoryBackend::context_to_sector(&QueryContext::Skill), Some("procedural".to_string()));
+        assert_eq!(OpenMemoryBackend::context_to_sector(&QueryContext::Reflection), Some("reflective".to_string()));
+        assert_eq!(OpenMemoryBackend::context_to_sector(&QueryContext::General), None);
     }
 
     #[test]
     fn backend_name() {
         let backend = OpenMemoryBackend::new("http://localhost:8080", None, None);
         assert_eq!(backend.name(), "openmemory");
+    }
+
+    #[test]
+    fn decay_state_display() {
+        assert_eq!(DecayState::Hot.to_string(), "hot");
+        assert_eq!(DecayState::Warm.to_string(), "warm");
+        assert_eq!(DecayState::Cold.to_string(), "cold");
     }
 }
