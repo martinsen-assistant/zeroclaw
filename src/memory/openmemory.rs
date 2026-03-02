@@ -559,7 +559,7 @@ impl Memory for OpenMemoryBackend {
     async fn list(
         &self,
         category: Option<&MemoryCategory>,
-        session_id: Option<&str>,
+        _session_id: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
         self.ensure_initialized().await?;
 
