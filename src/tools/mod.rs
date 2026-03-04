@@ -400,6 +400,7 @@ pub fn all_tools(
         agents,
         fallback_api_key,
         root_config,
+        None, // memory_session_id
     )
 }
 
@@ -419,6 +420,7 @@ pub fn all_tools_with_runtime(
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
+    memory_session_id: Option<&str>,
 ) -> Vec<Box<dyn Tool>> {
     let has_shell_access = runtime.has_shell_access();
     let has_filesystem_access = runtime.has_filesystem_access();
@@ -442,7 +444,10 @@ pub fn all_tools_with_runtime(
         Arc::new(CronRunsTool::new(config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryObserveTool::new(memory.clone(), security.clone())),
-        Arc::new(MemoryRecallTool::new(memory.clone())),
+        Arc::new(MemoryRecallTool::new_with_session(
+            memory.clone(),
+            memory_session_id,
+        )),
         Arc::new(MemoryForgetTool::new(memory, security.clone())),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
         Arc::new(TaskPlanTool::new(security.clone())),
@@ -1086,6 +1091,7 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            None, // memory_session_id
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"wasm_module"));
@@ -1127,6 +1133,7 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            None, // memory_session_id
         );
 
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();

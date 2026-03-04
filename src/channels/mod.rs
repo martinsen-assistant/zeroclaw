@@ -1875,7 +1875,12 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
     true
 }
 
-fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
+fn append_sender_turn(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    turn: ChatMessage,
+    session: Option<&Session>,
+) {
     let mut histories = ctx
         .conversation_histories
         .lock()
@@ -1884,6 +1889,17 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     turns.push(turn);
     while turns.len() > MAX_CHANNEL_HISTORY {
         turns.remove(0);
+    }
+    
+    // Persist to session backend if available
+    if let Some(session) = session {
+        if let Some(history) = histories.get(sender_key) {
+            let _ = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    session.update_history(history.clone()).await
+                })
+            });
+        }
     }
 }
 
@@ -3583,6 +3599,7 @@ or tune thresholds in config.",
         ctx.as_ref(),
         &history_key,
         ChatMessage::user(&persisted_user_content),
+        session.as_ref(),
     );
 
     // Build history from per-sender conversation cache.
@@ -4013,6 +4030,7 @@ or tune thresholds in config.",
                 ctx.as_ref(),
                 &history_key,
                 ChatMessage::assistant(&history_response),
+                session.as_ref(),
             );
             if runtime_defaults.auto_save_memory
                 && delivered_response.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
@@ -4151,6 +4169,7 @@ or tune thresholds in config.",
                     ChatMessage::assistant(
                         "[Task paused at tool-iteration limit — context preserved. Ask to continue.]",
                     ),
+                    session.as_ref(),
                 );
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
@@ -4202,6 +4221,7 @@ or tune thresholds in config.",
                         ctx.as_ref(),
                         &history_key,
                         ChatMessage::assistant("[Task failed — not continuing this request]"),
+                        session.as_ref(),
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
@@ -4251,6 +4271,7 @@ or tune thresholds in config.",
                 ctx.as_ref(),
                 &history_key,
                 ChatMessage::assistant("[Task timed out — not continuing this request]"),
+                session.as_ref(),
             );
             if let Some(channel) = target_channel.as_ref() {
                 let error_text =
@@ -5488,6 +5509,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        None, // memory_session_id
     );
 
     // Wire MCP tools into the registry before freezing — non-fatal.
@@ -6211,7 +6233,7 @@ mod tests {
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
         };
 
-        append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
+        append_sender_turn(&ctx, &sender, ChatMessage::user("hello"), None);
 
         let histories = ctx
             .conversation_histories
@@ -7003,7 +7025,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_approve: vec!["mock_price".to_string()],
             ..crate::config::AutonomyConfig::default()
         };
-        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
+        let _approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -7077,7 +7099,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_approve: vec!["mock_price".to_string()],
             ..crate::config::AutonomyConfig::default()
         };
-        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
+        let _approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -7165,7 +7187,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_approve: vec!["mock_price".to_string()],
             ..crate::config::AutonomyConfig::default()
         };
-        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
+        let _approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -7252,7 +7274,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_approve: vec!["mock_price".to_string()],
             ..crate::config::AutonomyConfig::default()
         };
-        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
+        let _approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -7398,7 +7420,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_approve: vec!["mock_price".to_string()],
             ..crate::config::AutonomyConfig::default()
         };
-        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
+        let _approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),

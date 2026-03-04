@@ -9,10 +9,12 @@ pub mod hygiene;
 pub mod lucid;
 pub mod markdown;
 pub mod none;
+pub mod openmemory;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
 pub mod qdrant;
 pub mod response_cache;
+pub mod session_context;
 pub mod snapshot;
 pub mod sqlite;
 pub mod traits;
@@ -28,6 +30,7 @@ pub use hybrid::SqliteQdrantHybridMemory;
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
+pub use openmemory::OpenMemoryBackend;
 #[cfg(feature = "memory-postgres")]
 pub use postgres::PostgresMemory;
 pub use qdrant::QdrantMemory;
@@ -67,6 +70,14 @@ where
         }
         MemoryBackendKind::Postgres => postgres_builder(),
         MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
+            Ok(Box::new(MarkdownMemory::new(workspace_dir)))
+        }
+        MemoryBackendKind::OpenMemory => {
+            // OpenMemory is handled separately in create_memory_with_storage_and_routes
+            // If we reach here, it means no config was provided - fall back to markdown
+            tracing::warn!(
+                "OpenMemory backend selected but no config available, falling back to markdown"
+            );
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
         }
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
@@ -363,6 +374,37 @@ pub fn create_memory_with_storage_and_routes(
 
     if matches!(backend_kind, MemoryBackendKind::Qdrant) {
         return Ok(Box::new(build_qdrant_memory(config, &resolved_embedding)?));
+    }
+
+    if matches!(backend_kind, MemoryBackendKind::OpenMemory) {
+        let url = config
+            .openmemory
+            .url
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| std::env::var("OPENMEMORY_URL").ok())
+            .filter(|s| !s.trim().is_empty())
+            .context(
+                "OpenMemory backend requires url in [memory.openmemory] or OPENMEMORY_URL env var",
+            )?;
+        let api_key = config
+            .openmemory
+            .api_key
+            .clone()
+            .or_else(|| std::env::var("OPENMEMORY_API_KEY").ok())
+            .filter(|s| !s.trim().is_empty());
+        let user_id = config
+            .openmemory
+            .user_id
+            .clone()
+            .or_else(|| std::env::var("OPENMEMORY_USER_ID").ok())
+            .filter(|s| !s.trim().is_empty());
+        tracing::info!(
+            "🧠 OpenMemory backend configured (url: {}, user_id: {:?})",
+            url,
+            user_id
+        );
+        return Ok(Box::new(OpenMemoryBackend::new(&url, api_key, user_id)));
     }
 
     if matches!(backend_kind, MemoryBackendKind::SqliteQdrantHybrid) {

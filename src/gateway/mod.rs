@@ -386,7 +386,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
     {
         anyhow::bail!(
-            "🛑 Refusing to bind to {host} — gateway would be exposed to the internet.\n\
+            "🛑 Refusing to bind to {host} — gateway would be reachable outside localhost\n\
+             (for example from your local network, and potentially the internet\n\
+             depending on your router/firewall setup).\n\
              Fix: use --host 127.0.0.1 (default), configure a tunnel, or set\n\
              [gateway] allow_public_bind = true in config.toml (NOT recommended)."
         );
@@ -460,6 +462,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        None, // memory_session_id
     ));
     let tools_registry: Arc<Vec<ToolSpec>> =
         Arc::new(tools_registry_exec.iter().map(|t| t.spec()).collect());

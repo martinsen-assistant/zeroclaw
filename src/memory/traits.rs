@@ -11,6 +11,32 @@ pub struct MemoryEntry {
     pub timestamp: String,
     pub session_id: Option<String>,
     pub score: Option<f64>,
+    /// Decay state: "hot", "warm", or "cold" (OpenMemory cognitive feature)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decay_state: Option<String>,
+    /// Connected memory IDs via waypoint graph (OpenMemory cognitive feature)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waypoints: Option<Vec<String>>,
+    /// Path taken through waypoint graph to reach this memory (multi-hop retrieval)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<Vec<String>>,
+}
+
+impl Default for MemoryEntry {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            key: String::new(),
+            content: String::new(),
+            category: MemoryCategory::Core,
+            timestamp: String::new(),
+            session_id: None,
+            score: None,
+            decay_state: None,
+            waypoints: None,
+            path: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for MemoryEntry {
@@ -22,6 +48,8 @@ impl std::fmt::Debug for MemoryEntry {
             .field("category", &self.category)
             .field("timestamp", &self.timestamp)
             .field("score", &self.score)
+            .field("decay_state", &self.decay_state)
+            .field("waypoints", &self.waypoints)
             .finish_non_exhaustive()
     }
 }
@@ -95,13 +123,10 @@ pub trait Memory: Send + Sync {
 
     /// Rebuild embeddings for all memories using the current embedding provider.
     /// Returns the number of memories reindexed, or an error if not supported.
-    ///
+    /// 
     /// Use this after changing the embedding model to ensure vector search
     /// works correctly with the new embeddings.
-    async fn reindex(
-        &self,
-        progress_callback: Option<Box<dyn Fn(usize, usize) + Send + Sync>>,
-    ) -> anyhow::Result<usize> {
+    async fn reindex(&self, progress_callback: Option<Box<dyn Fn(usize, usize) + Send + Sync>>) -> anyhow::Result<usize> {
         let _ = progress_callback;
         anyhow::bail!("Reindex not supported by {} backend", self.name())
     }
@@ -143,6 +168,9 @@ mod tests {
             timestamp: "2026-02-16T00:00:00Z".into(),
             session_id: Some("session-abc".into()),
             score: Some(0.98),
+            decay_state: Some("hot".into()),
+            waypoints: Some(vec!["id-2".into(), "id-3".into()]),
+            path: Some(vec!["id-0".into(), "id-1".into()]),
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -154,5 +182,8 @@ mod tests {
         assert_eq!(parsed.category, MemoryCategory::Core);
         assert_eq!(parsed.session_id.as_deref(), Some("session-abc"));
         assert_eq!(parsed.score, Some(0.98));
+        assert_eq!(parsed.decay_state.as_deref(), Some("hot"));
+        assert_eq!(parsed.waypoints.as_ref().map(|w| w.len()), Some(2));
+        assert_eq!(parsed.path.as_ref().map(|p| p.len()), Some(2));
     }
 }

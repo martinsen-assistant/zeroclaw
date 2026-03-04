@@ -363,6 +363,9 @@ impl Memory for QdrantMemory {
                     timestamp: payload.timestamp,
                     session_id: payload.session_id,
                     score: Some(point.score),
+                    decay_state: None,
+                    waypoints: None,
+                    path: None,
                 })
             })
             .collect();
@@ -419,6 +422,9 @@ impl Memory for QdrantMemory {
                 timestamp: payload.timestamp,
                 session_id: payload.session_id,
                 score: None,
+                decay_state: None,
+                waypoints: None,
+                path: None,
             })
         });
 
@@ -496,6 +502,9 @@ impl Memory for QdrantMemory {
                     timestamp: payload.timestamp,
                     session_id: payload.session_id,
                     score: None,
+                    decay_state: None,
+                    waypoints: None,
+                    path: None,
                 })
             })
             .collect();

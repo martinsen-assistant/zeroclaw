@@ -315,6 +315,7 @@ impl Agent {
             &config.agents,
             config.api_key.as_deref(),
             config,
+            None, // memory_session_id
         );
         let (tools, tool_filter_report) = tools::filter_primary_agent_tools(
             tools,
