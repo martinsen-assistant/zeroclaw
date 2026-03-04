@@ -165,7 +165,7 @@ struct AddMemoryResponse {
 
 /// Match item from /memory/query response
 #[derive(Debug, Clone, Deserialize)]
-struct MemoryMatch {
+pub struct MemoryMatch {
     id: String,
     content: String,
     score: f64,
@@ -544,16 +544,16 @@ impl Memory for OpenMemoryBackend {
         let sector = Self::category_to_sector(&category);
         
         // Build metadata with ZeroClaw-specific fields
+        // Note: We don't set "sector" here - let OpenMemory's ML classify it
         let metadata = serde_json::json!({
             "zeroclaw_key": key,
             "zeroclaw_category": category.to_string(),
             "zeroclaw_session_id": session_id,
-            "sector": sector,
         });
 
         let body = AddMemoryRequest {
             content: content.to_string(),
-            tags: Some(vec![sector.to_string()]),
+            tags: Some(vec![format!("zc:category:{}", category.to_string())]),
             metadata: Some(metadata),
             user_id: self.user_id.clone(),
         };
@@ -573,7 +573,7 @@ impl Memory for OpenMemoryBackend {
 
         tracing::debug!(
             key = %key,
-            sector = %sector,
+            category = %category.to_string(),
             "Stored memory in OpenMemory"
         );
 

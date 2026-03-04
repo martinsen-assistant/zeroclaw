@@ -12,10 +12,6 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-#[cfg(unix)]
-use std::fs::Permissions;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use tokio::fs;
 use tokio::process::{Child, Command as AsyncCommand};
 use tokio::sync::Mutex;
@@ -70,11 +66,11 @@ struct SimplexError {
 enum SimplexEvent {
     /// New message received
     #[serde(rename = "newChatItem")]
-    NewChatItem { chatItem: ChatItem },
+    NewChatItem { #[serde(rename = "chatItem")] chat_item: ChatItem },
     
     /// Contact request received
     #[serde(rename = "newContactRequest")]
-    NewContactRequest { contactRequest: ContactRequest },
+    NewContactRequest { #[serde(rename = "contactRequest")] contact_request: ContactRequest },
     
     /// Contact connected
     #[serde(rename = "contactConnection")]
@@ -93,11 +89,13 @@ enum SimplexEvent {
 #[derive(Debug, Deserialize)]
 struct ChatItem {
     /// Chat info (contact or group)
-    chatInfo: ChatInfo,
+    #[serde(rename = "chatInfo")]
+    chat_info: ChatInfo,
     /// Message content
     content: ChatContent,
     /// Message ID
-    itemId: String,
+    #[serde(rename = "itemId")]
+    item_id: String,
 }
 
 /// Chat info (contact or group)
@@ -113,7 +111,8 @@ struct ChatInfo {
 struct ChatContent {
     #[serde(rename = "type")]
     content_type: String,
-    msgContent: Option<MessageContent>,
+    #[serde(rename = "msgContent")]
+    msg_content: Option<MessageContent>,
 }
 
 /// Message content
@@ -125,14 +124,17 @@ struct MessageContent {
 /// Contact information
 #[derive(Debug, Deserialize)]
 struct Contact {
-    contactId: String,
-    localDisplayName: Option<String>,
+    #[serde(rename = "contactId")]
+    contact_id: String,
+    #[serde(rename = "localDisplayName")]
+    local_display_name: Option<String>,
 }
 
 /// Contact request
 #[derive(Debug, Deserialize)]
 struct ContactRequest {
-    contactRequestId: String,
+    #[serde(rename = "contactRequestId")]
+    contact_request_id: String,
 }
 
 /// SimpleX Chat channel configuration
@@ -144,6 +146,9 @@ pub struct SimplexConfig {
 
     /// Bot display name in SimpleX
     pub bot_display_name: Option<String>,
+
+    /// Contact address to auto-connect on startup (reusable SimpleX address)
+    pub contact_address: Option<String>,
 
     /// Allow file attachments from users
     #[serde(default)]
@@ -178,6 +183,7 @@ impl Default for SimplexConfig {
         Self {
             websocket_url: default_websocket_url(),
             bot_display_name: None,
+            contact_address: None,
             allow_files: false,
             ack_enabled: true,
             auto_download: true,
@@ -262,19 +268,19 @@ impl SimplexChannel {
             fs::create_dir_all(parent).await?;
         }
 
-        // Determine architecture
-        let arch = if cfg!(target_arch = "x86_64") {
-            "x86_64"
+        // Determine architecture and Ubuntu version
+        let (arch, ubuntu_ver) = if cfg!(target_arch = "x86_64") {
+            ("x86_64", "22_04")
         } else if cfg!(target_arch = "aarch64") {
-            "aarch64"
+            ("aarch64", "22_04")
         } else {
             anyhow::bail!("Unsupported architecture for SimpleX binary");
         };
 
-        // Download URL (simplified - actual URL structure may vary)
+        // Download URL - use Ubuntu binary (compatible with most Linux distros)
         let download_url = format!(
-            "https://github.com/simplex-chat/simplex-chat/releases/latest/download/simplex-chat-{}-{}",
-            std::env::consts::OS,
+            "https://github.com/simplex-chat/simplex-chat/releases/latest/download/simplex-chat-ubuntu-{}-{}",
+            ubuntu_ver,
             arch
         );
 
@@ -348,7 +354,7 @@ impl SimplexChannel {
         info!("Starting simplex-chat daemon: {} {}", binary_path.display(), args.join(" "));
 
         // Start the daemon process
-        let mut child = AsyncCommand::new(&binary_path)
+        let child = AsyncCommand::new(&binary_path)
             .args(&args)
             .spawn()
             .context("Failed to start simplex-chat daemon")?;
@@ -408,20 +414,20 @@ impl SimplexChannel {
         sender: &tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> Result<()> {
         match event {
-            SimplexEvent::NewChatItem { chatItem } => {
+            SimplexEvent::NewChatItem { chat_item } => {
                 // Extract message content
-                if let Some(content) = chatItem.content.msgContent {
+                if let Some(content) = chat_item.content.msg_content {
                     let text = content.text;
                     
                     // Get contact info
-                    let contact_name = chatItem.chatInfo.contact
+                    let contact_name = chat_item.chat_info.contact
                         .as_ref()
-                        .and_then(|c| c.localDisplayName.clone())
+                        .and_then(|c| c.local_display_name.clone())
                         .unwrap_or_else(|| "Unknown".to_string());
                     
-                    let contact_id = chatItem.chatInfo.contact
+                    let contact_id = chat_item.chat_info.contact
                         .as_ref()
-                        .map(|c| c.contactId.clone())
+                        .map(|c| c.contact_id.clone())
                         .unwrap_or_default();
 
                     info!("Message from {}: {}", contact_name, text);
@@ -435,7 +441,7 @@ impl SimplexChannel {
 
                     // Forward to ZeroClaw core
                     let channel_msg = ChannelMessage {
-                        id: chatItem.itemId.clone(),
+                        id: chat_item.item_id.clone(),
                         sender: contact_name.clone(),
                         reply_target: contact_id.clone(),
                         content: text.clone(),
@@ -450,17 +456,17 @@ impl SimplexChannel {
                     sender.send(channel_msg).await?;
                 }
             }
-            SimplexEvent::NewContactRequest { contactRequest } => {
-                info!("New contact request: {}", contactRequest.contactRequestId);
+            SimplexEvent::NewContactRequest { contact_request } => {
+                info!("New contact request: {}", contact_request.contact_request_id);
                 // TODO: Auto-accept contact requests based on config
             }
             SimplexEvent::ContactConnected { contact } => {
-                let name = contact.localDisplayName.unwrap_or_default();
-                info!("Contact connected: {} ({})", name, contact.contactId);
+                let name = contact.local_display_name.unwrap_or_default();
+                info!("Contact connected: {} ({})", name, contact.contact_id);
             }
             SimplexEvent::ContactDisconnected { contact } => {
-                let name = contact.localDisplayName.unwrap_or_default();
-                info!("Contact disconnected: {} ({})", name, contact.contactId);
+                let name = contact.local_display_name.unwrap_or_default();
+                info!("Contact disconnected: {} ({})", name, contact.contact_id);
             }
             SimplexEvent::Other => {
                 // Ignore unknown events
@@ -521,6 +527,33 @@ impl Channel for SimplexChannel {
                     .send(WsMessage::Text(serde_json::to_string(&api_ready)?.into()))
                     .await
                     .context("Failed to send API ready command")?;
+            }
+        }
+
+        // Auto-connect to contact address if configured
+        if let Some(ref contact_address) = self.config.contact_address {
+            if !contact_address.is_empty() {
+                info!("Auto-connecting to contact address: {}", contact_address);
+                
+                let connect_request = SimplexRequest {
+                    jsonrpc: "2.0".to_string(),
+                    id: self.next_request_id().await,
+                    method: "connectContact".to_string(),
+                    params: serde_json::json!({
+                        "contactLink": contact_address
+                    }),
+                };
+                
+                let mut sender_guard = self.ws_sender.lock().await;
+                if let Some(ref mut ws_sender) = *sender_guard {
+                    match ws_sender
+                        .send(WsMessage::Text(serde_json::to_string(&connect_request)?.into()))
+                        .await
+                    {
+                        Ok(_) => info!("Contact connection request sent"),
+                        Err(e) => warn!("Failed to send contact connection request: {}", e),
+                    }
+                }
             }
         }
 

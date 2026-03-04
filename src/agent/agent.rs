@@ -558,6 +558,10 @@ impl Agent {
             .load_context(self.memory.as_ref(), user_message)
             .await
             .unwrap_or_default();
+        
+        // Debug: Log memory context being injected
+        tracing::debug!("=== MEMORY CONTEXT ===");
+        tracing::debug!("Loaded memory context ({} chars): {}", context.len(), if context.is_empty() { "(empty)" } else { &context });
 
         // ── Research Phase ──────────────────────────────────────────────
         // If enabled and triggered, run a focused research turn to gather
@@ -627,6 +631,18 @@ impl Agent {
 
         for iteration in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            
+            // Debug: Log full prompt being sent to LLM
+            tracing::debug!("=== FULL PROMPT TO LLM (iteration {}) ===", iteration);
+            for (i, msg) in messages.iter().enumerate() {
+                tracing::debug!("Message {}: {:?} ({} chars)", i, msg.role, msg.content.len());
+                if msg.content.len() < 500 {
+                    tracing::debug!("  Content: {}", msg.content);
+                } else {
+                    tracing::debug!("  Content (first 500 chars): {}...", &msg.content[..500]);
+                }
+            }
+            
             let response = match self
                 .provider
                 .chat(
